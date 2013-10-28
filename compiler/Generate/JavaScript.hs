@@ -1,6 +1,6 @@
 module Generate.JavaScript where
 
-import Control.Arrow (first,(***))
+import Control.Arrow (second,(<<<))
 import Control.Applicative ((<$>),(<*>))
 import Control.Monad.State
 import qualified Data.List as List
@@ -12,8 +12,8 @@ import qualified Generate.Cases as Case
 import SourceSyntax.Everything
 import SourceSyntax.Location
 import qualified Transform.SortDefinitions as SD
-import Language.ECMAScript3.Syntax
-import Language.ECMAScript3.PrettyPrint
+import Language.ECMAScript5.Syntax
+import Language.ECMAScript5.PrettyPrint
 import Parse.Helpers (jsReserveds)
 
 makeSafe :: String -> String
@@ -32,9 +32,10 @@ split = go []
                        | otherwise -> go (vars ++ [x]) rest
           (x,[]) -> vars ++ [x]
 
+prop x e = PExpr () (PropId () (makeSafe x)) e
 var name = Id () (makeSafe name)
 ref name = VarRef () (var name)
-prop name = PropId () (var name)
+array xs = ArrayLit () (map Just xs)
 f <| x = CallExpr () f [x]
 args ==> e = FuncExpr () Nothing (map var args) [ ReturnStmt () (Just e) ]
 function args stmts = FuncExpr () Nothing (map var args) stmts
@@ -43,6 +44,7 @@ string = StringLit ()
 
 dotSep (x:xs) = foldl (DotRef ()) (ref x) (map var xs)
 obj = dotSep . split
+int n = NumLit () (Left n)
 
 varDecl x expr =
     VarDecl () (var x) (Just expr)
@@ -64,8 +66,8 @@ literal lit =
   case lit of
     Chr c -> obj "_N.chr" <| string [c]
     Str s -> string s
-    IntNum   n -> IntLit () n
-    FloatNum n -> NumLit () n
+    IntNum   n -> int (fromIntegral n)
+    FloatNum n -> NumLit () (Right n)
     Boolean  b -> BoolLit () b
 
 expression :: LExpr () () -> State Int (Expression ())
@@ -96,20 +98,19 @@ expression (L span expr) =
           do e' <- expression e
              fs' <- forM fs $ \(f,v) -> do
                       v' <- expression v
-                      return $ ArrayLit () [string f, v']
-             return $ obj "_N.replace" `call` [ArrayLit () fs', e']
+                      return $ array [string f, v']
+             return $ obj "_N.replace" `call` [array fs', e']
 
       Record fields ->
           do fields' <- forM fields $ \(f,e) -> do
                           (,) f <$> expression e
              let fieldMap = List.foldl' combine Map.empty fields'
-             return $ ObjectLit () $ (PropId () (var "_"), hidden fieldMap) : visible fieldMap
+             return $ ObjectLit () $ prop "_" (hidden fieldMap) : visible fieldMap
           where
             combine r (k,v) = Map.insertWith (++) k [v] r
-            prop = PropId () . var
-            hidden fs = ObjectLit () . map (prop *** ArrayLit ()) .
+            hidden fs = ObjectLit () . map (uncurry prop <<< second array) .
                         Map.toList . Map.filter (not . null) $ Map.map tail fs
-            visible fs = map (first prop) . Map.toList $ Map.map head fs
+            visible fs = map (uncurry prop) . Map.toList $ Map.map head fs
 
       Binop op e1 e2 -> binop span op e1 e2
 
@@ -177,14 +178,14 @@ expression (L span expr) =
 
       ExplicitList es ->
           do es' <- mapM expression es
-             return $ obj "_J.toList" <| ArrayLit () es'
+             return $ obj "_J.toList" <| array es'
 
       Data name es ->
           do es' <- mapM expression es
              return $ ObjectLit () (ctor : fields es')
           where
-            ctor = (prop "ctor", string (makeSafe name))
-            fields = zipWith (\n e -> (prop ("_" ++ show n), e)) [0..]
+            ctor = prop "ctor" (string (makeSafe name))
+            fields = zipWith (\n e -> prop ("_" ++ show n) e) [0..]
 
       Markdown doc _ -> return $ obj "Text.text" <| string (pad ++ md ++ pad)
           where pad = "<div style=\"height:0;width:0;\">&nbsp;</div>"
@@ -201,7 +202,7 @@ definition def =
       case pattern of
         PVar x
           | isOp x ->
-              let op = LBracket () (ref "_op") (string x) in
+              let op = BracketRef () (ref "_op") (string x) in
               return [ ExprStmt () $ AssignExpr () OpAssign op expr' ]
           | otherwise ->
               return [ VarDeclStmt () [ assign x ] ]
@@ -293,7 +294,7 @@ jsModule modul =
     thisModule = dotSep ("elm" : names modul ++ ["values"])
     programStmts =
         concat [ setup (Just "elm") (names modul ++ ["values"])
-               , [ IfSingleStmt () thisModule (ReturnStmt () (Just thisModule)) ]
+               , [ IfStmt () thisModule (ReturnStmt () (Just thisModule)) (EmptyStmt ()) ]
                , [ internalImports (List.intercalate "." (names modul)) ]
                , concatMap jsImport (imports modul)
                , concatMap importEvent (foreignImports modul)
@@ -307,13 +308,12 @@ jsModule modul =
     jsExports = assign ("elm" : names modul ++ ["values"]) (ObjectLit () exs)
         where
           exs = map entry . filter (not . isOp) $ "_op" : exports modul
-          entry x = (PropId () (var x), ref x)
+          entry x = prop x (ref x)
           
     assign path expr =
              case path of
                [x] -> VarDeclStmt () [ varDecl x expr ]
-               _   -> ExprStmt () $
-                      AssignExpr () OpAssign (LDot () (dotSep (init path)) (last path)) expr
+               _   -> ExprStmt () $ AssignExpr () OpAssign (dotSep path) expr
 
     jsImport (modul,_) = setup Nothing path ++ [ include ]
         where
@@ -347,7 +347,7 @@ jsModule modul =
                       [ VarDeclStmt () [varDecl "e" $ obj "document.createEvent" <| string "Event"]
                       , ExprStmt () $
                             obj "e.initEvent" `call` [ addId js, BoolLit () True, BoolLit () True ]
-                      , ExprStmt () $ AssignExpr () OpAssign (LDot () (ref "e") "value") (ref "v")
+                      , ExprStmt () $ AssignExpr () OpAssign (dotSep ["e","value"]) (ref "v")
                       , ExprStmt () $ obj "document.dispatchEvent" <| ref "e"
                       , ReturnStmt () (Just $ ref "v")
                       ]
@@ -411,7 +411,7 @@ binop span op e1 e2 =
         , specialOp ">"   $ cmp OpGT 0
         , specialOp "<="  $ cmp OpLT 1
         , specialOp ">="  $ cmp OpGT (-1)
-        , specialOp "div" $ \a b -> InfixExpr () OpBOr (InfixExpr () OpDiv a b) (IntLit () 0)
+        , specialOp "div" $ \a b -> InfixExpr () OpBOr (InfixExpr () OpDiv a b) (int 0)
         ]
 
-    cmp op n a b = InfixExpr () op (obj "_N.cmp" `call` [a,b]) (IntLit () n)
+    cmp op n a b = InfixExpr () op (obj "_N.cmp" `call` [a,b]) (int n)
